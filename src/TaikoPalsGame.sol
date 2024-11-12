@@ -1,182 +1,230 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import "forge-std/Test.sol";
+import "../src/TaikoPalsGame.sol";
 
-/**
- * @title TaikoPalsGame
- * @dev Core contract for the TaikoPals game, managing character cards and player interactions
- */
-contract TaikoPalsGame is 
-    Initializable, 
-    UUPSUpgradeable, 
-    AccessControl, 
-    Pausable, 
-    ReentrancyGuard 
-{
-    // === Data Structures ===
-    struct Card {
-        uint256 id;
-        uint256 characterType;
-        uint256 level;
-        address owner;
+contract TaikoPalsGameTest is Test {
+    TaikoPalsGame game;
+    address admin = address(this);
+    address player1 = address(0x1);
+    address player2 = address(0x2);
+    address minter = address(0x3);
+    address trader = address(0x4);
+
+    event CardMinted(address indexed player, uint256 indexed cardId, uint256 characterType);
+    event CardUpgraded(uint256 indexed cardId, uint256 newLevel);
+    event CardTraded(address indexed from, address indexed to, uint256 indexed cardId);
+
+    function setUp() public {
+        // Deploy and initialize contract
+        game = new TaikoPalsGame();
+        game.initialize();
+
+        // Setup test accounts
+        vm.deal(player1, 100 ether);
+        vm.deal(player2, 100 ether);
+
+        // Grant roles to test accounts
+        game.grantMinterRole(minter);
+        game.grantTraderRole(trader);
     }
 
-    // === State Variables ===
-    mapping(address => Card[]) private playerCards;
-    uint256 private nextCardId;
-
-    // === Role Definitions ===
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    bytes32 public constant TRADER_ROLE = keccak256("TRADER_ROLE");
-
-    // === Events ===
-    event CardMinted(address indexed player, uint256 cardId, uint256 characterType);
-    event CardUpgraded(uint256 cardId, uint256 newLevel);
-    event CardTraded(address indexed from, address indexed to, uint256 cardId);
-
-    // === Initialization ===
-    /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
-        _disableInitializers();
+    // === Role Tests ===
+    function testRoleAssignment() public {
+        assertTrue(game.hasRole(game.ADMIN_ROLE(), admin));
+        assertTrue(game.hasRole(game.MINTER_ROLE(), minter));
+        assertTrue(game.hasRole(game.TRADER_ROLE(), trader));
+        assertFalse(game.hasRole(game.MINTER_ROLE(), player1));
+        assertFalse(game.hasRole(game.TRADER_ROLE(), player1));
     }
 
-    function initialize() public initializer {
-        __UUPSUpgradeable_init();
-        __AccessControl_init();
-        __Pausable_init();
-        
-        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _setupRole(MINTER_ROLE, msg.sender);
-        nextCardId = 1;
+    function testRoleRevocation() public {
+        game.revokeMinterRole(minter);
+        game.revokeTraderRole(trader);
+        assertFalse(game.hasRole(game.MINTER_ROLE(), minter));
+        assertFalse(game.hasRole(game.TRADER_ROLE(), trader));
     }
 
-    // === Core Functions ===
+    // === Minting Tests ===
+    function testMintCharacterCard() public {
+        vm.prank(minter);
+        vm.expectEmit(true, true, true, true);
+        emit CardMinted(player1, 1, 1);
+        game.mintCharacterCard(player1, 1);
 
-    /**
-     * @notice Mints a new character card for a player
-     * @param player Address of the player receiving the card
-     * @param characterType Type/class of the character
-     */
-    function mintCharacterCard(address player, uint256 characterType) 
-        external 
-        onlyRole(MINTER_ROLE) 
-        whenNotPaused 
-        nonReentrant 
-    {
-        require(player != address(0), "Invalid player address");
-        require(characterType > 0, "Invalid character type");
-
-        uint256 cardId = nextCardId++;
+        uint256[] memory cardIds = game.getPlayerCardIds(player1);
+        assertEq(cardIds.length, 1);
         
-        Card memory newCard = Card({
-            id: cardId,
-            characterType: characterType,
-            level: 1,
-            owner: player
-        });
-
-        playerCards[player].push(newCard);
-        
-        emit CardMinted(player, cardId, characterType);
+        TaikoPalsGame.Card memory card = game.getCard(cardIds[0]);
+        assertEq(card.characterType, 1);
+        assertEq(card.level, 1);
+        assertEq(card.owner, player1);
+        assertTrue(card.exists);
     }
 
-    /**
-     * @notice Upgrades the level of a specific card
-     * @param cardId ID of the card to upgrade
-     */
-    function upgradeCard(uint256 cardId) 
-        external 
-        whenNotPaused 
-        nonReentrant 
-    {
-        bool found = false;
-        Card[] storage cards = playerCards[msg.sender];
-        
-        for (uint256 i = 0; i < cards.length; i++) {
-            if (cards[i].id == cardId) {
-                require(cards[i].owner == msg.sender, "Not card owner");
-                cards[i].level += 1;
-                emit CardUpgraded(cardId, cards[i].level);
-                found = true;
-                break;
-            }
+    function testMintWithInvalidCharacterType() public {
+        vm.prank(minter);
+        vm.expectRevert(TaikoPalsGame.InvalidCharacterType.selector);
+        game.mintCharacterCard(player1, 0);
+
+        vm.prank(minter);
+        vm.expectRevert(TaikoPalsGame.InvalidCharacterType.selector);
+        game.mintCharacterCard(player1, 11); // Above MAX_CHARACTER_TYPE
+    }
+
+    function testMintWithoutMinterRole() public {
+        vm.prank(player1);
+        vm.expectRevert();
+        game.mintCharacterCard(player1, 1);
+    }
+
+    // === Upgrade Tests ===
+    function testUpgradeCard() public {
+        // First mint a card
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        // Then upgrade it
+        vm.prank(player1);
+        vm.expectEmit(true, true, true, true);
+        emit CardUpgraded(1, 2);
+        game.upgradeCard(1);
+
+        TaikoPalsGame.Card memory card = game.getCard(1);
+        assertEq(card.level, 2);
+    }
+
+    function testUpgradeNonexistentCard() public {
+        vm.prank(player1);
+        vm.expectRevert(TaikoPalsGame.CardNotFound.selector);
+        game.upgradeCard(999);
+    }
+
+    function testUpgradeOtherPlayerCard() public {
+        // Mint card for player1
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        // Try to upgrade as player2
+        vm.prank(player2);
+        vm.expectRevert(TaikoPalsGame.NotCardOwner.selector);
+        game.upgradeCard(1);
+    }
+
+    function testUpgradeMaxLevel() public {
+        // Mint card
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        // Upgrade to max level
+        vm.startPrank(player1);
+        for(uint i = 1; i < 100; i++) {
+            game.upgradeCard(1);
         }
         
-        require(found, "Card not found");
+        // Try to upgrade beyond max level
+        vm.expectRevert(TaikoPalsGame.MaxLevelReached.selector);
+        game.upgradeCard(1);
+        vm.stopPrank();
     }
 
-    /**
-     * @notice Trades a card between players
-     * @param from Address of the sender
-     * @param to Address of the receiver
-     * @param cardId ID of the card to trade
-     */
-    function tradeCards(address from, address to, uint256 cardId) 
-        external 
-        onlyRole(TRADER_ROLE) 
-        whenNotPaused 
-        nonReentrant 
-    {
-        require(from != address(0) && to != address(0), "Invalid addresses");
-        require(from != to, "Cannot trade to self");
+    // === Trading Tests ===
+    function testTradeCards() public {
+        // Mint card for player1
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
 
-        bool found = false;
-        Card[] storage fromCards = playerCards[from];
+        // Trade card from player1 to player2
+        vm.prank(trader);
+        vm.expectEmit(true, true, true, true);
+        emit CardTraded(player1, player2, 1);
+        game.tradeCards(player1, player2, 1);
+
+        // Verify trade
+        uint256[] memory player1Cards = game.getPlayerCardIds(player1);
+        uint256[] memory player2Cards = game.getPlayerCardIds(player2);
+        assertEq(player1Cards.length, 0);
+        assertEq(player2Cards.length, 1);
         
-        for (uint256 i = 0; i < fromCards.length; i++) {
-            if (fromCards[i].id == cardId) {
-                Card memory cardToTrade = fromCards[i];
-                cardToTrade.owner = to;
-                
-                // Remove card from sender
-                fromCards[i] = fromCards[fromCards.length - 1];
-                fromCards.pop();
-                
-                // Add card to receiver
-                playerCards[to].push(cardToTrade);
-                
-                emit CardTraded(from, to, cardId);
-                found = true;
-                break;
-            }
-        }
-        
-        require(found, "Card not found");
+        TaikoPalsGame.Card memory card = game.getCard(player2Cards[0]);
+        assertEq(card.owner, player2);
     }
 
-    /**
-     * @notice Retrieves all cards owned by a player
-     * @param player Address of the player
-     * @return Array of cards owned by the player
-     */
-    function getPlayerCards(address player) 
-        external 
-        view 
-        returns (Card[] memory) 
-    {
-        return playerCards[player];
+    function testTradeWithoutTraderRole() public {
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        vm.prank(player1);
+        vm.expectRevert();
+        game.tradeCards(player1, player2, 1);
     }
 
-    // === Admin Functions ===
-    
-    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _pause();
-    }
-    
-    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _unpause();
+    function testTradeNonexistentCard() public {
+        vm.prank(trader);
+        vm.expectRevert(TaikoPalsGame.CardNotFound.selector);
+        game.tradeCards(player1, player2, 999);
     }
 
-    // === Upgrade Functions ===
-    
-    function _authorizeUpgrade(address newImplementation) 
-        internal 
-        override 
-        onlyRole(DEFAULT_ADMIN_ROLE) 
-    {}
+    function testTradeToSelf() public {
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        vm.prank(trader);
+        vm.expectRevert(TaikoPalsGame.SelfTradeNotAllowed.selector);
+        game.tradeCards(player1, player1, 1);
+    }
+
+    // === Pause Tests ===
+    function testPauseAndUnpause() public {
+        // Test pause
+        game.pause();
+        assertTrue(game.paused());
+
+        // Verify minting is blocked when paused
+        vm.prank(minter);
+        vm.expectRevert("Pausable: paused");
+        game.mintCharacterCard(player1, 1);
+
+        // Test unpause
+        game.unpause();
+        assertFalse(game.paused());
+
+        // Verify minting works after unpause
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+        uint256[] memory cardIds = game.getPlayerCardIds(player1);
+        assertEq(cardIds.length, 1);
+    }
+
+    function testPauseWithoutAdminRole() public {
+        vm.prank(player1);
+        vm.expectRevert();
+        game.pause();
+    }
+
+    // === Additional Tests for New Functionality ===
+    function testGetNonexistentCard() public {
+        vm.expectRevert(TaikoPalsGame.CardNotFound.selector);
+        game.getCard(999);
+    }
+
+    function testMintWithZeroAddress() public {
+        vm.prank(minter);
+        vm.expectRevert(TaikoPalsGame.InvalidAddress.selector);
+        game.mintCharacterCard(address(0), 1);
+    }
+
+    function testTradeWithZeroAddress() public {
+        vm.prank(minter);
+        game.mintCharacterCard(player1, 1);
+
+        vm.prank(trader);
+        vm.expectRevert(TaikoPalsGame.InvalidAddress.selector);
+        game.tradeCards(player1, address(0), 1);
+
+        vm.prank(trader);
+        vm.expectRevert(TaikoPalsGame.InvalidAddress.selector);
+        game.tradeCards(address(0), player2, 1);
+    }
 }
